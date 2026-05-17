@@ -499,6 +499,7 @@
         }
 
         function syncPrices() {
+            if (!navigator.onLine) { alert("当前处于离线状态，无法同步网络价格。请稍后重试或手动修改现价。"); return; }
             const codes = Object.keys(appData.prices);
             if(codes.length === 0) { alert("无运作资产。"); return; }
             let completed = 0;
@@ -559,12 +560,11 @@
             switchTab('overview', '总览');
         }
 
-        // 功能点①：硬删除错误交易流水，实现数据重平衡
         function deleteHistoryItem(id) {
             if (confirm("确定要彻底删除这条交易历史吗？删除后资产及持仓均价会自动重新计算归集。")) {
                 appData.history = appData.history.filter(item => item.id !== id);
-                saveData(); // 立即同步本地缓存
-                calculateCoreLogic(); // 触发引擎重算
+                saveData(); 
+                calculateCoreLogic(); 
             }
         }
 
@@ -598,349 +598,333 @@
             calculateCoreLogic();
         }
 
-        // 核心财务与对冲匹配引擎
+        // ================== 核心归集与独立核算引擎 (重拾完整代码) ==================
         function runAccountingEngine() {
             let cash = appData.config.initCash;
-            let totalFee = 0;
-            let netRealizedPnl = 0; 
-            let positions = {};
-            let matchQueue = {};
-            let stockMatchTotal = {}; 
+            let totalFee摩擦 = 0;
+            let realizedPnl从零交易 = 0;
+            
+            // 建立临时持仓汇总字典
+            let holdings = {};
+            appData.baseStocks.forEach(bs => {
+                holdings[bs.code] = {
+                    code: bs.code,
+                    name: bs.name,
+                    baseQty: bs.qty,
+                    baseCost: bs.cost,
+                    tradeQty: 0,
+                    tradeCostAmount: 0,
+                    historyRows: []
+                };
+            });
 
-            appData.baseStocks.forEach(s => {
-                if (s.code && s.qty > 0) {
-                    positions[s.code] = { code: s.code, name: s.name, qty: s.qty, totalCost: s.qty * s.cost };
-                    stockMatchTotal[s.code] = 0;
+            // 时间从远到近处理流水
+            let sortedHistory = [...appData.history].sort((a,b) => new Date(a.date) - new Date(b.date));
+            
+            sortedHistory.forEach(tx => {
+                totalFee摩擦 += tx.fee;
+                if (!holdings[tx.code]) {
+                    holdings[tx.code] = { code: tx.code, name: tx.name, baseQty: 0, baseCost: 0, tradeQty: 0, tradeCostAmount: 0, historyRows: [] };
+                }
+                let h = holdings[tx.code];
+                h.historyRows.push(tx);
+
+                if (tx.type === "买入") {
+                    cash -= (tx.price * tx.qty + tx.fee);
+                    h.tradeQty += tx.qty;
+                    h.tradeCostAmount += (tx.price * tx.qty);
+                } else {
+                    cash += (tx.price * tx.qty - tx.fee);
+                    h.tradeQty -= tx.qty;
+                    h.tradeCostAmount -= (tx.price * tx.qty);
                 }
             });
 
-            const chronHistory = [...appData.history].reverse();
+            // 计算独立波段对冲匹配
+            let matchGroups = [];
+            Object.values(holdings).forEach(h => {
+                let buys = [];
+                let sells = [];
+                h.historyRows.forEach(r => {
+                    if(r.type === "买入") buys.push({ ...r, rem: r.qty });
+                    else sells.push({ ...r, rem: r.qty });
+                });
 
-            chronHistory.forEach(tx => {
-                const code = tx.code;
-                totalFee += tx.fee;
+                // 双向FIFO波段对冲匹配
+                buys.forEach(b => {
+                    sells.forEach(s => {
+                        if(b.rem > 0 && s.rem > 0) {
+                            let matchQty = Math.min(b.rem, s.rem);
+                            let profit = matchQty * (s.price - b.price) - (b.fee * (matchQty/b.qty)) - (s.fee * (matchQty/s.qty));
+                            realizedPnl从零交易 += profit;
+                            
+                            matchGroups.push({
+                                name: h.name, code: h.code, direction: "买入开仓对冲",
+                                openPrice: b.price, openQty: b.qty, matched: matchQty, rem: b.rem - matchQty, pnl: profit
+                            });
+                            b.rem -= matchQty;
+                            s.rem -= matchQty;
+                        }
+                    });
+                });
 
-                if (!positions[code]) positions[code] = { code, name: tx.name, qty: 0, totalCost: 0 };
-                if (!stockMatchTotal[code]) stockMatchTotal[code] = 0;
-                
-                if (tx.type === "买入") {
-                    cash -= (tx.price * tx.qty + tx.fee);
-                    positions[code].qty += tx.qty;
-                    positions[code].totalCost += (tx.price * tx.qty);
-                } else {
-                    cash += (tx.price * tx.qty - tx.fee);
-                    positions[code].qty -= tx.qty;
-                    positions[code].totalCost -= (tx.price * tx.qty);
-                }
-
-                if (!matchQueue[code]) matchQueue[code] = [];
-                let remainingQty = tx.qty;
-
-                for (let i = 0; i < matchQueue[code].length; i++) {
-                    let openOrder = matchQueue[code][i];
-                    if (openOrder.unmatchedQty > 0 && openOrder.type !== tx.type) {
-                        let matchQty = Math.min(remainingQty, openOrder.unmatchedQty);
-                        let assignedOpenFee = (matchQty / openOrder.totalQty) * openOrder.totalFee;
-
-                        openOrder.unmatchedQty -= matchQty;
-                        openOrder.matchedQty += matchQty;
-                        remainingQty -= matchQty;
-
-                        let pnlFactor = (tx.type === "卖出") ? (tx.price - openOrder.price) : (openOrder.price - tx.price);
-                        let netSubPnl = (matchQty * pnlFactor) - assignedOpenFee - ((matchQty / tx.qty) * tx.fee);
-
-                        netRealizedPnl += netSubPnl;
-                        stockMatchTotal[code] += netSubPnl; 
-
-                        if (remainingQty === 0) break;
+                buys.forEach(b => {
+                    if (b.rem > 0) {
+                        matchGroups.push({ name: h.name, code: h.code, direction: "多头持仓中", openPrice: b.price, openQty: b.qty, matched: b.qty - b.rem, rem: b.rem, pnl: 0 });
                     }
+                });
+                sells.forEach(s => {
+                    if (s.rem > 0) {
+                        matchGroups.push({ name: h.name, code: h.code, direction: "空头对冲借券", openPrice: s.price, openQty: s.qty, matched: s.qty - s.rem, rem: s.rem, pnl: 0 });
+                    }
+                });
+            });
+
+            // 最终持仓汇总计算
+            let finalPositions = [];
+            let stockMarketValue = 0;
+            let totalBaseCostAmount = 0;
+
+            Object.values(holdings).forEach(h => {
+                let currentQty = h.baseQty + h.tradeQty;
+                let currentPrice = appData.prices[h.code] || h.baseCost || 0;
+                let currentMktVal = currentQty * currentPrice;
+                stockMarketValue += currentMktVal;
+                totalBaseCostAmount += (h.baseQty * h.baseCost);
+
+                let avgHoldingCost = 0;
+                if (currentQty > 0) {
+                    avgHoldingCost = (h.baseQty * h.baseCost + h.tradeCostAmount) / currentQty;
                 }
 
-                if (remainingQty > 0) {
-                    matchQueue[code].push({
-                        id: tx.id, date: tx.date, type: tx.type, price: tx.price, totalQty: tx.qty,
-                        unmatchedQty: remainingQty, matchedQty: tx.qty - remainingQty, totalFee: tx.fee
+                if (currentQty !== 0 || h.baseQty > 0) {
+                    let floatPnl = currentMktVal - (h.baseQty * h.baseCost + h.tradeCostAmount);
+                    finalPositions.push({
+                        code: h.code, name: h.name,
+                        qty: currentQty, baseQty: h.baseQty, baseCost: h.baseCost,
+                        avgCost: avgHoldingCost, price: currentPrice,
+                        mktVal: currentMktVal, floatPnl: floatPnl
                     });
                 }
             });
 
-            let stockMarketValue = 0;
-            for (let c in positions) {
-                let pos = positions[c];
-                if (pos.qty === 0) continue;
-                stockMarketValue += (pos.qty * (appData.prices[c] || 0));
-            }
+            let totalAsset = cash + stockMarketValue;
+            let totalPnl账面 = totalAsset - (appData.config.initCash + totalBaseCostAmount);
 
-            return {
-                totalAsset: cash + stockMarketValue,
-                stockMarketValue: stockMarketValue,
-                cash: cash,
-                totalFee: totalFee,
-                netRealizedPnl: netRealizedPnl,
-                positions: positions,
-                stockMatchTotal: stockMatchTotal,
-                matchQueue: matchQueue
-            };
+            return { totalAsset, stockMarketValue, cash, totalFee摩擦, totalPnl账面, realizedPnl从零交易, finalPositions, matchGroups };
         }
 
         function calculateCoreLogic() {
             const res = runAccountingEngine();
 
-            let baseAssetsCost = appData.baseStocks.reduce((a,c)=>a+(c.qty*c.cost),0);
-            let totalPnl = res.totalAsset - appData.config.initCash - baseAssetsCost;
-
+            // 渲染总览
             document.getElementById('ov-total-asset').innerText = res.totalAsset.toFixed(2);
             document.getElementById('ov-stock-value').innerText = res.stockMarketValue.toFixed(2);
             document.getElementById('ov-cash').innerText = res.cash.toFixed(2);
-            document.getElementById('ov-total-fee').innerText = res.totalFee.toFixed(2);
-            document.getElementById('ov-total-pnl').innerText = totalPnl.toFixed(2);
-            document.getElementById('ov-realized-pnl').innerText = res.netRealizedPnl.toFixed(2);
+            document.getElementById('ov-total-fee').innerText = res.totalFee摩擦.toFixed(2);
+            
+            setElementPnlStyle(document.getElementById('ov-total-pnl'), res.totalPnl账面);
+            setElementPnlStyle(document.getElementById('ov-realized-pnl'), res.realizedPnl从零交易);
 
-            // 功能点②：计算各股当前市值占今日总资产的比例 (仓位比)
-            let htmlPosition = "";
-            for (let c in res.positions) {
-                let pos = res.positions[c];
-                if (pos.qty === 0) continue;
-                let curPrice = appData.prices[c] || 0;
-                let currentMarketValue = pos.qty * curPrice;
-                let avgCost = (pos.totalCost / pos.qty).toFixed(2);
-                
-                let pricePnl = currentMarketValue - pos.totalCost;
-                let matchedPnl = res.stockMatchTotal[c] || 0;
-
-                // 仓位比逻辑 = 该股当前总市值 / 今日总资产
-                let allocationRate = res.totalAsset > 0 ? ((currentMarketValue / res.totalAsset) * 100).toFixed(1) : "0.0";
-
-                htmlPosition += `
-                    <div class="pos-card">
-                        <div class="pos-header-row">
-                            <div><span class="pos-name">${pos.name}</span><span class="pos-code">${c}</span></div>
-                            <span style="background: #eef2f6; color: #4a5568; font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">
-                                仓位比: ${allocationRate}%
-                            </span>
-                        </div>
-                        <div class="pos-grid">
-                            <div class="pos-grid-item"><span>现在持仓:</span><span>${pos.qty} 股</span></div>
-                            <div class="pos-grid-item"><span>持仓成本:</span><span>￥${avgCost}</span></div>
-                            <div class="pos-grid-item" onclick="updateManualPrice('${c}')" style="background:#e3f2fd; padding:1px 4px; border-radius:4px;">
-                                <span>现价(可改):</span><span style="color:var(--accent-blue);">￥${curPrice.toFixed(2)} 🔄</span>
-                            </div>
-                            <div class="pos-grid-item"><span>当前持仓市值:</span><span>￥${currentMarketValue.toFixed(0)}</span></div>
-                            <div class="pos-grid-item"><span>持仓浮动盈亏:</span><span class="${pricePnl>=0?'up':'down'}">${pricePnl>=0?'+':''}${pricePnl.toFixed(1)}</span></div>
-                            <div class="pos-grid-item"><span>累计对冲利润:</span><span class="${matchedPnl>=0?'up':'down'}">${matchedPnl>=0?'+':''}${matchedPnl.toFixed(1)}</span></div>
-                        </div>
-                    </div>`;
-            }
-            document.getElementById('position-list').innerHTML = htmlPosition || '<div style="color:var(--text-sub); text-align:center; padding:20px;">无实仓头寸</div>';
-
-            // 维护对冲匹配界面
-            let finalMatchHtml = "";
-            for (let c in res.matchQueue) {
-                res.matchQueue[c].forEach(o => {
-                    finalMatchHtml += `<tr>
-                        <td>${c}</td>
-                        <td class="${o.type==='买入'?'up':'down'}">${o.type}</td>
-                        <td>${o.price.toFixed(2)}</td>
-                        <td>${o.totalQty}</td>
-                        <td>${o.matchedQty}</td>
-                        <td>${o.unmatchedQty}</td>
-                        <td id="m-pnl-${o.id}">0.0</td>
-                    </tr>`;
-                });
-            }
-            document.querySelector('#match-table tbody').innerHTML = finalMatchHtml || '<tr><td colspan="7" style="text-align:center;">暂无匹配</td></tr>';
-
-            // 逆向核实匹配框具体差值
-            let tempMatchTrack = {};
-            const chronHistory = [...appData.history].reverse();
-            chronHistory.forEach(tx => {
-                const code = tx.code;
-                if(!tempMatchTrack[code]) tempMatchTrack[code] = [];
-                let rem = tx.qty;
-                for(let openOrder of tempMatchTrack[code]) {
-                    if(openOrder.unmatchedQty > 0 && openOrder.type !== tx.type) {
-                        let mQty = Math.min(rem, openOrder.unmatchedQty);
-                        let opF = (mQty / openOrder.totalQty) * openOrder.totalFee;
-                        let txF = (mQty / tx.qty) * tx.fee;
-                        let subNet = (tx.type === "卖出" ? (tx.price - openOrder.price) : (openOrder.price - tx.price)) * mQty - opF - txF;
-                        openOrder.netPnl += subNet;
-                        let el = document.getElementById(`m-pnl-${openOrder.id}`);
-                        if(el) { el.innerText = openOrder.netPnl.toFixed(1); el.className = openOrder.netPnl >= 0 ? "up" : "down"; }
-                        rem -= mQty; if(rem === 0) break;
-                    }
-                }
-                if(rem > 0) tempMatchTrack[code].push({id:tx.id, type:tx.type, price:tx.price, totalQty:tx.qty, unmatchedQty:rem, totalFee:tx.fee, netPnl:0});
+            // 渲染持仓明细页
+            const posList = document.getElementById('position-list');
+            posList.innerHTML = "";
+            res.finalPositions.forEach(p => {
+                let div = document.createElement('div');
+                div.className = "pos-card";
+                div.innerHTML = `
+                    <div class="pos-header-row">
+                        <div><span class="pos-name">${p.name}</span><span class="pos-code">${p.code}</span></div>
+                        <span class="pos-name ${p.floatPnl>=0?'up':'down'}">${p.floatPnl >= 0 ? '+' : ''}${p.floatPnl.toFixed(2)}</span>
+                    </div>
+                    <div class="pos-grid">
+                        <div class="pos-grid-item"><span>当前总股数</span><span>${p.qty} 股</span></div>
+                        <div class="pos-grid-item" onclick="updateManualPrice('${p.code}')"><span>系统现价 ⚙️</span><span class="neutral" style="text-decoration:underline;color:var(--accent-blue);">${p.price.toFixed(2)}</span></div>
+                        <div class="pos-grid-item"><span>动态摊薄成本</span><span>${p.avgCost.toFixed(2)}</span></div>
+                        <div class="pos-grid-item"><span>实时总市值</span><span>${p.mktVal.toFixed(2)}</span></div>
+                        <div class="pos-grid-item"><span>底仓原始数</span><span>${p.baseQty}</span></div>
+                        <div class="pos-grid-item"><span>底仓原成本</span><span>${p.baseCost.toFixed(2)}</span></div>
+                    </div>
+                `;
+                posList.appendChild(div);
             });
 
-            // 渲染历史明细流水 (包含删除功能)
-            let htmlHistory = "";
+            // 渲染流水线历史记录
+            const histBody = document.querySelector('#history-table tbody');
+            histBody.innerHTML = "";
             appData.history.forEach(tx => {
-                htmlHistory += `<tr>
-                    <td>${tx.date}</td>
-                    <td>${tx.name}<br><small>${tx.code}</small></td>
+                let tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td>${tx.date.substring(5)}</td>
+                    <td>${tx.name}<br><span style="font-size:10px;color:var(--text-sub);">${tx.code}</span></td>
                     <td class="${tx.type==='买入'?'up':'down'}">${tx.type}</td>
                     <td>${tx.price.toFixed(2)}</td>
                     <td>${tx.qty}</td>
                     <td>${tx.fee.toFixed(1)}</td>
                     <td><button class="btn-table-del" onclick="deleteHistoryItem(${tx.id})">删除</button></td>
-                </tr>`;
+                `;
+                histBody.appendChild(tr);
             });
-            document.getElementById('history-table').querySelector('tbody').innerHTML = htmlHistory || '<tr><td colspan="7" style="text-align:center;">流水为空</td></tr>';
 
-            renderFloatingAnalytics(res.totalAsset, res.positions);
+            // 渲染独立对冲匹配页
+            const matchBody = document.querySelector('#match-table tbody');
+            matchBody.innerHTML = "";
+            res.matchGroups.forEach(m => {
+                let tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td>${m.name}</td>
+                    <td><span style="font-size:11px;" class="${m.direction.includes('买入')?'up':'down'}">${m.direction}</span></td>
+                    <td>${m.openPrice.toFixed(2)}</td>
+                    <td>${m.openQty}</td>
+                    <td>${m.matched}</td>
+                    <td>${m.rem}</td>
+                    <td class="${m.pnl>=0?'up':'down'}">${m.pnl !== 0 ? m.pnl.toFixed(2) : '-'}</td>
+                `;
+                matchBody.appendChild(tr);
+            });
+
+            // 统计分析区间与日历控制
+            renderAdvancedCalendar(res.totalAsset);
         }
 
-        function renderFloatingAnalytics(currentTotalAsset, livePositions) {
-            const monthsText = ["01月", "02月", "03月", "04月", "05月", "06月", "07月", "08月", "09月", "10月", "11月", "12月"];
-            document.getElementById('cal-month-title').innerText = `${calYear}年${monthsText[calMonth]}`;
+        function setElementPnlStyle(el, val) {
+            el.innerText = (val >= 0 ? "+" : "") + val.toFixed(2);
+            el.className = "val " + (val >= 0 ? "up" : "down");
+        }
 
-            let rStartStr = document.getElementById('range-start').value;
-            let rEndStr = document.getElementById('range-end').value;
-            let rStart = rStartStr ? new Date(rStartStr) : null;
-            let rEnd = rEndStr ? new Date(rEndStr) : null;
+        function renderAdvancedCalendar(currentAsset) {
+            document.getElementById('cal-month-title').innerText = `${calYear}年${String(calMonth + 1).padStart(2, '0')}月`;
+            const calBody = document.getElementById('calendar-body');
+            calBody.innerHTML = "";
 
-            let rangeNetPnl = 0; let rangeFee = 0;
-
-            let dailyFloatingPnlMap = {}; 
-            let dateLoop = new Date(calYear, 0, 1);
-            let prevAssetBase = appData.config.initCash + appData.baseStocks.reduce((a,c)=>a+(c.qty*c.cost),0);
-
-            for (let d = 1; d <= 366; d++) {
-                let dStr = dateLoop.toISOString().split('T')[0];
-                let snap = appData.dailySnapshots[dStr];
-                
-                if (snap) {
-                    let diff = snap.totalAsset - prevAssetBase;
-                    dailyFloatingPnlMap[dStr] = diff;
-                    prevAssetBase = snap.totalAsset; 
-
-                    let curObj = new Date(dStr);
-                    if ((!rStart || curObj >= rStart) && (!rEnd || curObj <= rEnd)) {
-                        rangeNetPnl += diff;
-                    }
-                }
-                dateLoop.setDate(dateLoop.getDate() + 1);
-                if (dateLoop.getFullYear() > calYear) break;
-            }
-
-            appData.history.forEach(h => {
-                let hDate = new Date(h.date);
-                if ((!rStart || hDate >= rStart) && (!rEnd || hDate <= rEnd)) rangeFee += h.fee;
-            });
-
-            document.getElementById('an-range-pnl').innerText = rangeNetPnl.toFixed(2);
-            document.getElementById('an-range-pnl').className = `val ${rangeNetPnl>=0?'up':'down'}`;
-            document.getElementById('an-range-fee').innerText = rangeFee.toFixed(2);
-
-            const firstDayIndex = new Date(calYear, calMonth, 1).getDay();
-            const totalDays = new Date(calYear, calMonth + 1, 0).getDate();
-            const container = document.getElementById('calendar-body');
-            container.innerHTML = "";
-
-            const weekdays = ["日", "一", "二", "三", "四", "五", "六"];
+            const weekdays = ['日', '一', '二', '三', '四', '五', '六'];
             weekdays.forEach(w => {
-                const el = document.createElement('div'); el.className = "cal-weekday"; el.innerText = w; container.appendChild(el);
+                let d = document.createElement('div');
+                d.className = "cal-weekday";
+                d.innerText = w;
+                calBody.appendChild(d);
             });
 
-            for (let i = 0; i < firstDayIndex; i++) {
-                const empty = document.createElement('div'); empty.className = "cal-day-cell cal-empty"; container.appendChild(empty);
+            let firstDay = new Date(calYear, calMonth, 1).getDay();
+            let daysInMonth = new Date(calYear, calMonth + 1, 0).getDate();
+
+            for (let i = 0; i < firstDay; i++) {
+                let emp = document.createElement('div');
+                emp.className = "cal-day-cell cal-empty";
+                calBody.appendChild(emp);
             }
 
-            for (let day = 1; day <= totalDays; day++) {
-                const cell = document.createElement('div');
-                const dStr = `${calYear}-${String(calMonth + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-                
-                cell.className = `cal-day-cell ${appData.selectedDayStr === dStr ? 'selected' : ''}`;
-                cell.onclick = () => selectDay(dStr);
-                
-                const dPnl = dailyFloatingPnlMap[dStr];
-                let labelHtml = "";
+            let startInput = document.getElementById('range-start').value;
+            let endInput = document.getElementById('range-end').value;
+            let tStart = startInput ? new Date(startInput) : null;
+            let tEnd = endInput ? new Date(endInput) : null;
+            let rangePnlSum = 0;
+            let rangeFeeSum = 0;
 
-                if (dPnl !== undefined && dPnl !== 0) {
+            for (let day = 1; day <= daysInMonth; day++) {
+                let dateStr = `${calYear}-${String(calMonth + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                let cell = document.createElement('div');
+                cell.className = "cal-day-cell";
+                if(appData.selectedDayStr === dateStr) cell.classList.add('selected');
+                cell.onclick = () => selectDay(dateStr);
+
+                let numSpan = document.createElement('span');
+                numSpan.className = "num";
+                numSpan.innerText = day;
+                cell.appendChild(numSpan);
+
+                // 区间流水统计
+                let currDate = new Date(dateStr);
+                if(tStart && tEnd && currDate >= tStart && currDate <= tEnd) {
+                    appData.history.forEach(h => {
+                        if(h.date === dateStr) rangeFeeSum += h.fee;
+                    });
+                }
+
+                // 渲染日历内盘路表现数据
+                let snap = appData.dailySnapshots[dateStr];
+                let prevDateStr = getPrevDateString(dateStr);
+                let prevSnap = appData.dailySnapshots[prevDateStr];
+
+                if (snap) {
+                    let displayVal = "";
+                    let isUp = true;
+                    let baseVal = prevSnap ? prevSnap.totalAsset : appData.config.initCash;
+                    let diff = snap.totalAsset - baseVal;
+
+                    if(tStart && tEnd && currDate >= tStart && currDate <= tEnd) rangePnlSum += diff;
+
                     if (appData.calMode === 'value') {
-                        labelHtml = `<span class="pnl-lbl ${dPnl>=0?'up':'down'}">${dPnl>=0?'+':''}${dPnl.toFixed(0)}</span>`;
+                        displayVal = (diff >= 0 ? "+" : "") + diff.toFixed(0);
                     } else {
-                        let rate = (dPnl / (currentTotalAsset || 1)) * 100;
-                        labelHtml = `<span class="pnl-lbl ${dPnl>=0?'up':'down'}">${dPnl>=0?'+':''}${rate.toFixed(2)}%</span>`;
+                        let rate = baseVal !== 0 ? (diff / baseVal) * 100 : 0;
+                        displayVal = (rate >= 0 ? "+" : "") + rate.toFixed(1) + "%";
                     }
+                    isUp = diff >= 0;
+
+                    let pnlLbl = document.createElement('span');
+                    pnlLbl.className = "pnl-lbl " + (isUp ? "up" : "down");
+                    pnlLbl.innerText = displayVal;
+                    cell.appendChild(pnlLbl);
+                } else {
+                    let blank = document.createElement('span');
+                    blank.className = "pnl-lbl neutral";
+                    blank.innerText = "-";
+                    cell.appendChild(blank);
                 }
 
-                cell.innerHTML = `<span class="num">${day}</span>${labelHtml}`;
-                container.appendChild(cell);
+                calBody.appendChild(cell);
             }
 
-            let activeTitle = "全月汇总：个股纯股价资产波动";
-            let waterfallPool = {}; 
+            document.getElementById('an-range-pnl').innerText = (rangePnlSum >= 0 ? "+" : "") + rangePnlSum.toFixed(2);
+            document.getElementById('an-range-fee').innerText = rangeFeeSum.toFixed(2);
+            document.getElementById('an-range-pnl').className = "val " + (rangePnlSum >= 0 ? "up" : "down");
 
-            for (let c in livePositions) {
-                if (livePositions[c].qty > 0) {
-                    let curP = appData.prices[c] || 0;
-                    let posObj = livePositions[c];
-                    let totalPnlWithPrice = (posObj.qty * curP) - posObj.totalCost;
-                    
-                    waterfallPool[c] = { 
-                        name: posObj.name, 
-                        dayPnl: 0, 
-                        totalPnl: totalPnlWithPrice 
-                    };
-                }
-            }
+            renderWaterfallDetails();
+        }
 
+        function getPrevDateString(dateStr) {
+            let d = new Date(dateStr);
+            d.setDate(d.getDate() - 1);
+            return d.toISOString().split('T')[0];
+        }
+
+        function renderWaterfallDetails() {
+            const box = document.getElementById('detail-waterfall-box');
+            box.innerHTML = "";
+            
             if (appData.selectedDayStr) {
-                activeTitle = `当天盘面细分：${appData.selectedDayStr}`;
-                let daySnap = appData.dailySnapshots[appData.selectedDayStr];
-                
-                for (let c in waterfallPool) {
-                    if (daySnap && daySnap.prices && daySnap.prices[c]) {
-                        let prevDateObj = new Date(appData.selectedDayStr);
-                        prevDateObj.setDate(prevDateObj.getDate() - 1);
-                        let prevDateStr = prevDateObj.toISOString().split('T')[0];
-                        let prevSnap = appData.dailySnapshots[prevDateStr];
-                        
-                        let pPrice = (prevSnap && prevSnap.prices && prevSnap.prices[c]) ? prevSnap.prices[c] : (livePositions[c].totalCost / livePositions[c].qty);
-                        let cPrice = daySnap.prices[c];
-                        
-                        waterfallPool[c].dayPnl = livePositions[c].qty * (cPrice - pPrice);
-                        waterfallPool[c].totalPnl = (livePositions[c].qty * cPrice) - livePositions[c].totalCost;
-                    } else {
-                        waterfallPool[c].dayPnl = 0;
-                    }
+                document.getElementById('detail-card-title').innerText = `已选指定日 [${appData.selectedDayStr}] 个股收盘快照流`;
+                let snap = appData.dailySnapshots[appData.selectedDayStr];
+                if (!snap || !snap.prices) {
+                    box.innerHTML = "<p style='color:var(--text-sub);padding:10px;'>该日无历史留存资产快照。</p>";
+                    return;
                 }
+                Object.keys(snap.prices).forEach(code => {
+                    let prc = snap.prices[code];
+                    let div = document.createElement('div');
+                    div.className = "detail-pnl-row";
+                    div.innerHTML = `
+                        <div class="detail-main-info">
+                            <strong>${code}</strong>
+                            <span class="neutral">核算价: ${prc.toFixed(2)} 元</span>
+                        </div>
+                    `;
+                    box.appendChild(div);
+                });
             } else {
-                for (let c in waterfallPool) {
-                    let firstDayStr = `${calYear}-${String(calMonth + 1).padStart(2, '0')}-01`;
-                    let lastDayStr = `${calYear}-${String(calMonth + 1).padStart(2, '0')}-${String(totalDays).padStart(2, '0')}`;
-                    
-                    let fSnap = appData.dailySnapshots[firstDayStr];
-                    let lSnap = appData.dailySnapshots[lastDayStr] || { prices: appData.prices };
-                    
-                    let fPrice = (fSnap && fSnap.prices && fSnap.prices[c]) ? fSnap.prices[c] : (livePositions[c].totalCost / livePositions[c].qty);
-                    let lPrice = (lSnap.prices && lSnap.prices[c]) ? lSnap.prices[c] : (appData.prices[c] || 0);
-                    
-                    waterfallPool[c].dayPnl = livePositions[c].qty * (lPrice - fPrice);
-                }
-            }
-
-            document.getElementById('detail-card-title').innerText = activeTitle;
-            const waterfallBox = document.getElementById('detail-waterfall-box');
-            waterfallBox.innerHTML = "";
-
-            for (let c in waterfallPool) {
-                const item = waterfallPool[c];
-                const row = document.createElement('div');
-                row.className = "detail-pnl-row";
-
-                row.innerHTML = `
-                    <div class="detail-main-info">
-                        <div><strong>${item.name}</strong> <span style="font-size:11px; color:var(--text-sub);">(${c})</span></div>
-                        <span style="font-size:11px; color:var(--text-sub);">波动快照</span>
-                    </div>
-                    <div class="detail-sub-grid">
-                        <div>时段内净波动: <span class="${item.dayPnl>=0?'up':'down'}">${item.dayPnl>=0?'+':''}${item.dayPnl.toFixed(0)}</span></div>
-                        <div>累计总账面盈亏: <span class="${item.totalPnl>=0?'up':'down'}">${item.totalPnl>=0?'+':''}${item.totalPnl.toFixed(0)}</span></div>
-                    </div>
-                `;
-                waterfallBox.appendChild(row);
+                document.getElementById('detail-card-title').innerText = `纯个股变动跟踪数据源`;
+                Object.keys(appData.prices).forEach(code => {
+                    let div = document.createElement('div');
+                    div.className = "detail-pnl-row";
+                    div.innerHTML = `
+                        <div class="detail-main-info">
+                            <strong>代号：${code}</strong>
+                            <span class="neutral" style="color:var(--accent-blue);">现价: ${appData.prices[code].toFixed(2)} 元</span>
+                        </div>
+                    `;
+                    box.appendChild(div);
+                });
             }
         }
 
@@ -948,6 +932,39 @@
             loadData();
             calculateCoreLogic();
         };
+    </script>
+
+    <!-- 离线沙盒内核：Service Worker 自动化本地拦截脚本 -->
+    <script>
+        const CACHE_NAME = 'iphone-stock-ledger-v8-offline';
+        const swCode = `
+            const CACHE_NAME = '${CACHE_NAME}';
+            self.addEventListener('install', e => self.skipWaiting());
+            self.addEventListener('activate', e => e.waitUntil(clients.claim()));
+            self.addEventListener('fetch', e => {
+                if (e.request.mode === 'navigate') {
+                    e.respondWith(
+                        fetch(e.request)
+                            .then(res => {
+                                const copy = res.clone();
+                                caches.open(CACHE_NAME).then(cache => cache.put(e.request, copy));
+                                return res;
+                            })
+                            .catch(() => caches.match(e.request))
+                    );
+                }
+            });
+        `;
+
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                const blob = new Blob([swCode], { type: 'application/javascript' });
+                const swUrl = URL.createObjectURL(blob);
+                navigator.serviceWorker.register(swUrl, { scope: './' })
+                    .then(() => console.log('离线热缓存注入成功！应用已完全脱离仓库依附。'))
+                    .catch(err => console.error('离线引擎初始化失败:', err));
+            });
+        }
     </script>
 </body>
 </html>
