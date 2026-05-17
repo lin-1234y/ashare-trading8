@@ -2,8 +2,15 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>iPhone 股票交易全功能独立账本 v8</title>
+    
+    <!-- 🟢 强力激活 iPhone 原生全离线独立 WebApp 属性 (专治断网无法打开) -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="股票独立账本">
+    <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100' fill='%23007aff'><circle cx='50' cy='50' r='50'/><text x='50' y='65' font-size='45' font-family='sans-serif' font-weight='bold' fill='white' text-anchor='middle'>📊</text></svg>">
+
     <style>
         :root {
             --bg-color: #f2f2f7;
@@ -16,7 +23,7 @@
             --border-color: #e5e5ea;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: var(--text-main); background-color: var(--bg-color); padding-bottom: 75px; font-size: 14px; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: var(--text-main); background-color: var(--bg-color); padding-bottom: 75px; font-size: 14px; padding-top: env(safe-area-inset-top); }
         
         header { background: var(--card-bg); padding: 15px; border-bottom: 1px solid var(--border-color); position: sticky; top: 0; z-index: 90; display: flex; justify-content: space-between; align-items: center; }
         header h1 { font-size: 18px; font-weight: 600; }
@@ -100,7 +107,7 @@
         .btn-table-del { background: #ffebee; color: var(--accent-red); border: none; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; cursor: pointer; }
 
         /* 底部系统Tab导航 */
-        .tab-bar { position: fixed; bottom: 0; left: 0; right: 0; height: 60px; background: var(--card-bg); border-top: 1px solid var(--border-color); display: flex; justify-content: space-around; align-items: center; z-index: 90; }
+        .tab-bar { position: fixed; bottom: 0; left: 0; right: 0; height: 60px; background: var(--card-bg); border-top: 1px solid var(--border-color); display: flex; justify-content: space-around; align-items: center; z-index: 90; padding-bottom: env(safe-area-inset-bottom); }
         .tab-item { display: flex; flex-direction: column; align-items: center; color: var(--text-sub); text-decoration: none; font-size: 10px; width: 16%; border: none; background: none; }
         .tab-item.active { color: var(--accent-blue); }
         .tab-item .icon { font-size: 19px; margin-bottom: 2px; }
@@ -598,13 +605,12 @@
             calculateCoreLogic();
         }
 
-        // ================== 核心归集与独立核算引擎 (重拾完整代码) ==================
+        // ================== 核心归集与独立核算引擎 ==================
         function runAccountingEngine() {
             let cash = appData.config.initCash;
             let totalFee摩擦 = 0;
             let realizedPnl从零交易 = 0;
             
-            // 建立临时持仓汇总字典
             let holdings = {};
             appData.baseStocks.forEach(bs => {
                 holdings[bs.code] = {
@@ -618,7 +624,6 @@
                 };
             });
 
-            // 时间从远到近处理流水
             let sortedHistory = [...appData.history].sort((a,b) => new Date(a.date) - new Date(b.date));
             
             sortedHistory.forEach(tx => {
@@ -640,7 +645,6 @@
                 }
             });
 
-            // 计算独立波段对冲匹配
             let matchGroups = [];
             Object.values(holdings).forEach(h => {
                 let buys = [];
@@ -650,7 +654,6 @@
                     else sells.push({ ...r, rem: r.qty });
                 });
 
-                // 双向FIFO波段对冲匹配
                 buys.forEach(b => {
                     sells.forEach(s => {
                         if(b.rem > 0 && s.rem > 0) {
@@ -680,7 +683,6 @@
                 });
             });
 
-            // 最终持仓汇总计算
             let finalPositions = [];
             let stockMarketValue = 0;
             let totalBaseCostAmount = 0;
@@ -717,7 +719,6 @@
         function calculateCoreLogic() {
             const res = runAccountingEngine();
 
-            // 渲染总览
             document.getElementById('ov-total-asset').innerText = res.totalAsset.toFixed(2);
             document.getElementById('ov-stock-value').innerText = res.stockMarketValue.toFixed(2);
             document.getElementById('ov-cash').innerText = res.cash.toFixed(2);
@@ -726,7 +727,6 @@
             setElementPnlStyle(document.getElementById('ov-total-pnl'), res.totalPnl账面);
             setElementPnlStyle(document.getElementById('ov-realized-pnl'), res.realizedPnl从零交易);
 
-            // 渲染持仓明细页
             const posList = document.getElementById('position-list');
             posList.innerHTML = "";
             res.finalPositions.forEach(p => {
@@ -749,7 +749,6 @@
                 posList.appendChild(div);
             });
 
-            // 渲染流水线历史记录
             const histBody = document.querySelector('#history-table tbody');
             histBody.innerHTML = "";
             appData.history.forEach(tx => {
@@ -766,7 +765,6 @@
                 histBody.appendChild(tr);
             });
 
-            // 渲染独立对冲匹配页
             const matchBody = document.querySelector('#match-table tbody');
             matchBody.innerHTML = "";
             res.matchGroups.forEach(m => {
@@ -783,7 +781,6 @@
                 matchBody.appendChild(tr);
             });
 
-            // 统计分析区间与日历控制
             renderAdvancedCalendar(res.totalAsset);
         }
 
@@ -833,7 +830,6 @@
                 numSpan.innerText = day;
                 cell.appendChild(numSpan);
 
-                // 区间流水统计
                 let currDate = new Date(dateStr);
                 if(tStart && tEnd && currDate >= tStart && currDate <= tEnd) {
                     appData.history.forEach(h => {
@@ -841,7 +837,6 @@
                     });
                 }
 
-                // 渲染日历内盘路表现数据
                 let snap = appData.dailySnapshots[dateStr];
                 let prevDateStr = getPrevDateString(dateStr);
                 let prevSnap = appData.dailySnapshots[prevDateStr];
@@ -932,39 +927,6 @@
             loadData();
             calculateCoreLogic();
         };
-    </script>
-
-    <!-- 离线沙盒内核：Service Worker 自动化本地拦截脚本 -->
-    <script>
-        const CACHE_NAME = 'iphone-stock-ledger-v8-offline';
-        const swCode = `
-            const CACHE_NAME = '${CACHE_NAME}';
-            self.addEventListener('install', e => self.skipWaiting());
-            self.addEventListener('activate', e => e.waitUntil(clients.claim()));
-            self.addEventListener('fetch', e => {
-                if (e.request.mode === 'navigate') {
-                    e.respondWith(
-                        fetch(e.request)
-                            .then(res => {
-                                const copy = res.clone();
-                                caches.open(CACHE_NAME).then(cache => cache.put(e.request, copy));
-                                return res;
-                            })
-                            .catch(() => caches.match(e.request))
-                    );
-                }
-            });
-        `;
-
-        if ('serviceWorker' in navigator) {
-            window.addEventListener('load', () => {
-                const blob = new Blob([swCode], { type: 'application/javascript' });
-                const swUrl = URL.createObjectURL(blob);
-                navigator.serviceWorker.register(swUrl, { scope: './' })
-                    .then(() => console.log('离线热缓存注入成功！应用已完全脱离仓库依附。'))
-                    .catch(err => console.error('离线引擎初始化失败:', err));
-            });
-        }
     </script>
 </body>
 </html>
